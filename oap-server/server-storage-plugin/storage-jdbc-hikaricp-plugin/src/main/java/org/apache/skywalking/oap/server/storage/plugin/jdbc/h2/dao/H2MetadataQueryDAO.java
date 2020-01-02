@@ -20,6 +20,7 @@ package org.apache.skywalking.oap.server.storage.plugin.jdbc.h2.dao;
 
 import com.google.common.base.Strings;
 import com.google.gson.Gson;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import java.io.IOException;
 import java.sql.Connection;
@@ -27,10 +28,10 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import org.apache.skywalking.oap.server.core.query.entity.Attribute;
 import org.apache.skywalking.oap.server.core.query.entity.Database;
 import org.apache.skywalking.oap.server.core.query.entity.Endpoint;
-import org.apache.skywalking.oap.server.core.query.entity.Language;
 import org.apache.skywalking.oap.server.core.query.entity.LanguageTrans;
 import org.apache.skywalking.oap.server.core.query.entity.Service;
 import org.apache.skywalking.oap.server.core.query.entity.ServiceInstance;
@@ -68,9 +69,10 @@ public class H2MetadataQueryDAO implements IMetadataQueryDAO {
     public int numOfService(long startTimestamp, long endTimestamp) throws IOException {
         StringBuilder sql = new StringBuilder();
         List<Object> condition = new ArrayList<>(5);
-        sql.append("select count(*) num from ").append(ServiceInventory.MODEL_NAME).append(" where ");
+        sql.append("select count(*) num from ").append(ServiceInventory.INDEX_NAME).append(" where ");
         setTimeRangeCondition(sql, condition, startTimestamp, endTimestamp);
-        sql.append(" and ").append(ServiceInventory.IS_ADDRESS).append("=0");
+        sql.append(" and ").append(ServiceInventory.IS_ADDRESS).append("=" + BooleanUtils.FALSE);
+        sql.append(" and ").append(ServiceInventory.NODE_TYPE).append("=" + NodeType.Normal.value());
 
         try (Connection connection = h2Client.getConnection()) {
             try (ResultSet resultSet = h2Client.executeQuery(connection, sql.toString(), condition.toArray(new Object[0]))) {
@@ -85,10 +87,10 @@ public class H2MetadataQueryDAO implements IMetadataQueryDAO {
     }
 
     @Override
-    public int numOfEndpoint(long startTimestamp, long endTimestamp) throws IOException {
+    public int numOfEndpoint() throws IOException {
         StringBuilder sql = new StringBuilder();
         List<Object> condition = new ArrayList<>(5);
-        sql.append("select count(*) num from ").append(EndpointInventory.MODEL_NAME).append(" where ");
+        sql.append("select count(*) num from ").append(EndpointInventory.INDEX_NAME).append(" where ");
         sql.append(EndpointInventory.DETECT_POINT).append("=").append(DetectPoint.SERVER.ordinal());
 
         try (Connection connection = h2Client.getConnection()) {
@@ -105,11 +107,10 @@ public class H2MetadataQueryDAO implements IMetadataQueryDAO {
     }
 
     @Override
-    public int numOfConjectural(long startTimestamp, long endTimestamp,
-        int nodeTypeValue) throws IOException {
+    public int numOfConjectural(int nodeTypeValue) throws IOException {
         StringBuilder sql = new StringBuilder();
         List<Object> condition = new ArrayList<>(5);
-        sql.append("select count(*) num from ").append(ServiceInventory.MODEL_NAME).append(" where ");
+        sql.append("select count(*) num from ").append(ServiceInventory.INDEX_NAME).append(" where ");
         sql.append(ServiceInventory.NODE_TYPE).append("=?");
         condition.add(nodeTypeValue);
 
@@ -129,10 +130,34 @@ public class H2MetadataQueryDAO implements IMetadataQueryDAO {
     public List<Service> getAllServices(long startTimestamp, long endTimestamp) throws IOException {
         StringBuilder sql = new StringBuilder();
         List<Object> condition = new ArrayList<>(5);
-        sql.append("select * from ").append(ServiceInventory.MODEL_NAME).append(" where ");
+        sql.append("select * from ").append(ServiceInventory.INDEX_NAME).append(" where ");
         setTimeRangeCondition(sql, condition, startTimestamp, endTimestamp);
-        sql.append(" and ").append(ServiceInventory.IS_ADDRESS).append("=? limit ").append(metadataQueryMaxSize);
+        sql.append(" and ").append(ServiceInventory.IS_ADDRESS).append("=?");
         condition.add(BooleanUtils.FALSE);
+        sql.append(" and ").append(ServiceInventory.NODE_TYPE).append("=?");
+        condition.add(NodeType.Normal.value());
+        sql.append(" limit ").append(metadataQueryMaxSize);
+
+        try (Connection connection = h2Client.getConnection()) {
+            try (ResultSet resultSet = h2Client.executeQuery(connection, sql.toString(), condition.toArray(new Object[0]))) {
+                return buildServices(resultSet);
+            }
+        } catch (SQLException e) {
+            throw new IOException(e);
+        }
+    }
+
+    @Override
+    public List<Service> getAllBrowserServices(long startTimestamp, long endTimestamp) throws IOException {
+        StringBuilder sql = new StringBuilder();
+        List<Object> condition = new ArrayList<>(5);
+        sql.append("select * from ").append(ServiceInventory.INDEX_NAME).append(" where ");
+        setTimeRangeCondition(sql, condition, startTimestamp, endTimestamp);
+        sql.append(" and ").append(ServiceInventory.IS_ADDRESS).append("=?");
+        condition.add(BooleanUtils.FALSE);
+        sql.append(" and ").append(ServiceInventory.NODE_TYPE).append("=?");
+        condition.add(NodeType.Browser.value());
+        sql.append(" limit ").append(metadataQueryMaxSize);
 
         try (Connection connection = h2Client.getConnection()) {
             try (ResultSet resultSet = h2Client.executeQuery(connection, sql.toString(), condition.toArray(new Object[0]))) {
@@ -147,7 +172,7 @@ public class H2MetadataQueryDAO implements IMetadataQueryDAO {
     public List<Database> getAllDatabases() throws IOException {
         StringBuilder sql = new StringBuilder();
         List<Object> condition = new ArrayList<>(1);
-        sql.append("select * from ").append(ServiceInventory.MODEL_NAME).append(" where ");
+        sql.append("select * from ").append(ServiceInventory.INDEX_NAME).append(" where ");
         sql.append(ServiceInventory.NODE_TYPE).append("=? limit ").append(metadataQueryMaxSize);
         condition.add(NodeType.Database.value());
 
@@ -181,10 +206,12 @@ public class H2MetadataQueryDAO implements IMetadataQueryDAO {
         String keyword) throws IOException {
         StringBuilder sql = new StringBuilder();
         List<Object> condition = new ArrayList<>(5);
-        sql.append("select * from ").append(ServiceInventory.MODEL_NAME).append(" where ");
+        sql.append("select * from ").append(ServiceInventory.INDEX_NAME).append(" where ");
         setTimeRangeCondition(sql, condition, startTimestamp, endTimestamp);
         sql.append(" and ").append(ServiceInventory.IS_ADDRESS).append("=?");
         condition.add(BooleanUtils.FALSE);
+        sql.append(" and ").append(ServiceInventory.NODE_TYPE).append("=?");
+        condition.add(NodeType.Normal.value());
         if (!Strings.isNullOrEmpty(keyword)) {
             sql.append(" and ").append(ServiceInventory.NAME).append(" like \"%").append(keyword).append("%\"");
         }
@@ -203,7 +230,7 @@ public class H2MetadataQueryDAO implements IMetadataQueryDAO {
     public Service searchService(String serviceCode) throws IOException {
         StringBuilder sql = new StringBuilder();
         List<Object> condition = new ArrayList<>(5);
-        sql.append("select * from ").append(ServiceInventory.MODEL_NAME).append(" where ");
+        sql.append("select * from ").append(ServiceInventory.INDEX_NAME).append(" where ");
         sql.append(ServiceInventory.IS_ADDRESS).append("=?");
         condition.add(BooleanUtils.FALSE);
         sql.append(" and ").append(ServiceInventory.NAME).append(" = ?");
@@ -231,7 +258,7 @@ public class H2MetadataQueryDAO implements IMetadataQueryDAO {
         int limit) throws IOException {
         StringBuilder sql = new StringBuilder();
         List<Object> condition = new ArrayList<>(5);
-        sql.append("select * from ").append(EndpointInventory.MODEL_NAME).append(" where ");
+        sql.append("select * from ").append(EndpointInventory.INDEX_NAME).append(" where ");
         sql.append(EndpointInventory.SERVICE_ID).append("=?");
         condition.add(serviceId);
         if (!Strings.isNullOrEmpty(keyword)) {
@@ -263,7 +290,7 @@ public class H2MetadataQueryDAO implements IMetadataQueryDAO {
         String serviceId) throws IOException {
         StringBuilder sql = new StringBuilder();
         List<Object> condition = new ArrayList<>(5);
-        sql.append("select * from ").append(ServiceInstanceInventory.MODEL_NAME).append(" where ");
+        sql.append("select * from ").append(ServiceInstanceInventory.INDEX_NAME).append(" where ");
         setTimeRangeCondition(sql, condition, startTimestamp, endTimestamp);
         sql.append(" and ").append(ServiceInstanceInventory.SERVICE_ID).append("=?");
         condition.add(serviceId);
@@ -276,33 +303,31 @@ public class H2MetadataQueryDAO implements IMetadataQueryDAO {
                     ServiceInstance serviceInstance = new ServiceInstance();
                     serviceInstance.setId(resultSet.getString(ServiceInstanceInventory.SEQUENCE));
                     serviceInstance.setName(resultSet.getString(ServiceInstanceInventory.NAME));
+                    serviceInstance.setInstanceUUID(resultSet.getString(ServiceInstanceInventory.INSTANCE_UUID));
 
                     String propertiesString = resultSet.getString(ServiceInstanceInventory.PROPERTIES);
                     if (!Strings.isNullOrEmpty(propertiesString)) {
                         JsonObject properties = GSON.fromJson(propertiesString, JsonObject.class);
-                        if (properties.has(LANGUAGE)) {
-                            serviceInstance.setLanguage(LanguageTrans.INSTANCE.value(properties.get(LANGUAGE).getAsString()));
-                        } else {
-                            serviceInstance.setLanguage(Language.UNKNOWN);
-                        }
-
-                        if (properties.has(OS_NAME)) {
-                            serviceInstance.getAttributes().add(new Attribute(OS_NAME, properties.get(OS_NAME).getAsString()));
-                        }
-                        if (properties.has(HOST_NAME)) {
-                            serviceInstance.getAttributes().add(new Attribute(HOST_NAME, properties.get(HOST_NAME).getAsString()));
-                        }
-                        if (properties.has(PROCESS_NO)) {
-                            serviceInstance.getAttributes().add(new Attribute(PROCESS_NO, properties.get(PROCESS_NO).getAsString()));
-                        }
-                        if (properties.has(IPV4S)) {
-                            List<String> ipv4s = ServiceInstanceInventory.PropertyUtil.ipv4sDeserialize(properties.get(IPV4S).getAsString());
-                            for (String ipv4 : ipv4s) {
-                                serviceInstance.getAttributes().add(new Attribute(ServiceInstanceInventory.PropertyUtil.IPV4S, ipv4));
+                        for (Map.Entry<String, JsonElement> property : properties.entrySet()) {
+                            String key = property.getKey();
+                            String value = property.getValue().getAsString();
+                            if (key.equals(LANGUAGE)) {
+                                serviceInstance.setLanguage(LanguageTrans.INSTANCE.value(value));
+                            } else if (key.equals(OS_NAME)) {
+                                serviceInstance.getAttributes().add(new Attribute(OS_NAME, value));
+                            } else if (key.equals(HOST_NAME)) {
+                                serviceInstance.getAttributes().add(new Attribute(HOST_NAME, value));
+                            } else if (key.equals(PROCESS_NO)) {
+                                serviceInstance.getAttributes().add(new Attribute(PROCESS_NO, value));
+                            } else if (key.equals(IPV4S)) {
+                                List<String> ipv4s = ServiceInstanceInventory.PropertyUtil.ipv4sDeserialize(properties.get(IPV4S).getAsString());
+                                for (String ipv4 : ipv4s) {
+                                    serviceInstance.getAttributes().add(new Attribute(ServiceInstanceInventory.PropertyUtil.IPV4S, ipv4));
+                                }
+                            } else {
+                                serviceInstance.getAttributes().add(new Attribute(key, value));
                             }
                         }
-                    } else {
-                        serviceInstance.setLanguage(Language.UNKNOWN);
                     }
 
                     serviceInstances.add(serviceInstance);

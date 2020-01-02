@@ -18,14 +18,28 @@
 
 package org.apache.skywalking.apm.agent.core.context;
 
-import java.util.*;
+import java.util.LinkedList;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 import org.apache.skywalking.apm.agent.core.boot.ServiceManager;
 import org.apache.skywalking.apm.agent.core.conf.Config;
-import org.apache.skywalking.apm.agent.core.context.trace.*;
-import org.apache.skywalking.apm.agent.core.dictionary.*;
-import org.apache.skywalking.apm.agent.core.logging.api.*;
+import org.apache.skywalking.apm.agent.core.conf.RemoteDownstreamConfig;
+import org.apache.skywalking.apm.agent.core.context.trace.AbstractSpan;
+import org.apache.skywalking.apm.agent.core.context.trace.AbstractTracingSpan;
+import org.apache.skywalking.apm.agent.core.context.trace.EntrySpan;
+import org.apache.skywalking.apm.agent.core.context.trace.ExitSpan;
+import org.apache.skywalking.apm.agent.core.context.trace.LocalSpan;
+import org.apache.skywalking.apm.agent.core.context.trace.NoopExitSpan;
+import org.apache.skywalking.apm.agent.core.context.trace.NoopSpan;
+import org.apache.skywalking.apm.agent.core.context.trace.TraceSegment;
+import org.apache.skywalking.apm.agent.core.context.trace.TraceSegmentRef;
+import org.apache.skywalking.apm.agent.core.context.trace.WithPeerInfo;
+import org.apache.skywalking.apm.agent.core.dictionary.DictionaryManager;
+import org.apache.skywalking.apm.agent.core.dictionary.DictionaryUtil;
+import org.apache.skywalking.apm.agent.core.dictionary.PossibleFound;
+import org.apache.skywalking.apm.agent.core.logging.api.ILog;
+import org.apache.skywalking.apm.agent.core.logging.api.LogManager;
 import org.apache.skywalking.apm.agent.core.sampling.SamplingService;
 import org.apache.skywalking.apm.util.StringUtil;
 
@@ -60,7 +74,7 @@ public class TracingContext implements AbstractTracerContext {
     /**
      * Active spans stored in a Stack, usually called 'ActiveSpanStack'. This {@link LinkedList} is the in-memory
      * storage-structure. <p> I use {@link LinkedList#removeLast()}, {@link LinkedList#addLast(Object)} and {@link
-     * LinkedList#last} instead of {@link #pop()}, {@link #push(AbstractSpan)}, {@link #peek()}
+     * LinkedList#getLast()} instead of {@link #pop()}, {@link #push(AbstractSpan)}, {@link #peek()}
      */
     private LinkedList<AbstractSpan> activeSpanStack = new LinkedList<AbstractSpan>();
 
@@ -72,9 +86,11 @@ public class TracingContext implements AbstractTracerContext {
     /**
      * The counter indicates
      */
-    private AtomicInteger asyncSpanCounter;
+    private volatile AtomicInteger asyncSpanCounter;
     private volatile boolean isRunningInAsyncMode;
-    private ReentrantLock asyncFinishLock;
+    private volatile ReentrantLock asyncFinishLock;
+
+    private volatile boolean running;
 
     /**
      * Initialize all fields with default value.
@@ -82,12 +98,9 @@ public class TracingContext implements AbstractTracerContext {
     TracingContext() {
         this.segment = new TraceSegment();
         this.spanIdGenerator = 0;
-        if (samplingService == null) {
-            samplingService = ServiceManager.INSTANCE.findService(SamplingService.class);
-        }
-        asyncSpanCounter = new AtomicInteger(0);
+        samplingService = ServiceManager.INSTANCE.findService(SamplingService.class);
         isRunningInAsyncMode = false;
-        asyncFinishLock = new ReentrantLock();
+        running = true;
     }
 
     /**
@@ -118,34 +131,58 @@ public class TracingContext implements AbstractTracerContext {
         } else {
             carrier.setPeerId(peerId);
         }
+
+        AbstractSpan firstSpan = first();
+        String firstSpanOperationName = firstSpan.getOperationName();
+
         List<TraceSegmentRef> refs = this.segment.getRefs();
-        int operationId;
-        String operationName;
+        int operationId = DictionaryUtil.inexistence();
+        String operationName = "";
         int entryApplicationInstanceId;
+
         if (refs != null && refs.size() > 0) {
             TraceSegmentRef ref = refs.get(0);
             operationId = ref.getEntryEndpointId();
             operationName = ref.getEntryEndpointName();
             entryApplicationInstanceId = ref.getEntryServiceInstanceId();
         } else {
-            AbstractSpan firstSpan = first();
-            operationId = firstSpan.getOperationId();
-            operationName = firstSpan.getOperationName();
+            if (firstSpan.isEntry()) {
+                /**
+                 * Since 6.6.0, if first span is not entry span, then this is an internal segment(no RPC),
+                 * rather than an endpoint.
+                 */
+                operationId = firstSpan.getOperationId();
+                operationName = firstSpanOperationName;
+            }
             entryApplicationInstanceId = this.segment.getApplicationInstanceId();
+
         }
         carrier.setEntryServiceInstanceId(entryApplicationInstanceId);
 
         if (operationId == DictionaryUtil.nullValue()) {
             if (!StringUtil.isEmpty(operationName)) {
                 carrier.setEntryEndpointName(operationName);
+            } else {
+                /**
+                 * Since 6.6.0, if first span is not entry span, then this is an internal segment(no RPC),
+                 * rather than an endpoint.
+                 */
             }
         } else {
             carrier.setEntryEndpointId(operationId);
         }
 
-        int parentOperationId = first().getOperationId();
+        int parentOperationId = firstSpan.getOperationId();
         if (parentOperationId == DictionaryUtil.nullValue()) {
-            carrier.setParentEndpointName(first().getOperationName());
+            if (firstSpan.isEntry() && !StringUtil.isEmpty(firstSpanOperationName)) {
+                carrier.setParentEndpointName(firstSpanOperationName);
+            } else {
+                /**
+                 * Since 6.6.0, if first span is not entry span, then this is an internal segment(no RPC),
+                 * rather than an endpoint.
+                 */
+                carrier.setParentEndpointId(DictionaryUtil.inexistence());
+            }
         } else {
             carrier.setParentEndpointId(parentOperationId);
         }
@@ -182,17 +219,27 @@ public class TracingContext implements AbstractTracerContext {
             activeSpan().getSpanId(),
             segment.getRelatedGlobalTraces());
         int entryOperationId;
-        String entryOperationName;
+        String entryOperationName = "";
         int entryApplicationInstanceId;
         AbstractSpan firstSpan = first();
+        String firstSpanOperationName = firstSpan.getOperationName();
+
         if (refs != null && refs.size() > 0) {
             TraceSegmentRef ref = refs.get(0);
             entryOperationId = ref.getEntryEndpointId();
             entryOperationName = ref.getEntryEndpointName();
             entryApplicationInstanceId = ref.getEntryServiceInstanceId();
         } else {
-            entryOperationId = firstSpan.getOperationId();
-            entryOperationName = firstSpan.getOperationName();
+            if (firstSpan.isEntry()) {
+                entryOperationId = firstSpan.getOperationId();
+                entryOperationName = firstSpanOperationName;
+            } else {
+                /**
+                 * Since 6.6.0, if first span is not entry span, then this is an internal segment(no RPC),
+                 * rather than an endpoint.
+                 */
+                entryOperationId = DictionaryUtil.inexistence();
+            }
             entryApplicationInstanceId = this.segment.getApplicationInstanceId();
         }
         snapshot.setEntryApplicationInstanceId(entryApplicationInstanceId);
@@ -200,15 +247,29 @@ public class TracingContext implements AbstractTracerContext {
         if (entryOperationId == DictionaryUtil.nullValue()) {
             if (!StringUtil.isEmpty(entryOperationName)) {
                 snapshot.setEntryOperationName(entryOperationName);
+            } else {
+                /**
+                 * Since 6.6.0, if first span is not entry span, then this is an internal segment(no RPC),
+                 * rather than an endpoint.
+                 */
             }
         } else {
             snapshot.setEntryOperationId(entryOperationId);
         }
 
-        if (firstSpan.getOperationId() == DictionaryUtil.nullValue()) {
-            snapshot.setParentOperationName(firstSpan.getOperationName());
+        int parentOperationId = firstSpan.getOperationId();
+        if (parentOperationId == DictionaryUtil.nullValue()) {
+            if (firstSpan.isEntry() && !StringUtil.isEmpty(firstSpanOperationName)) {
+                snapshot.setParentOperationName(firstSpanOperationName);
+            } else {
+                /**
+                 * Since 6.6.0, if first span is not entry span, then this is an internal segment(no RPC),
+                 * rather than an endpoint.
+                 */
+                snapshot.setParentOperationId(DictionaryUtil.inexistence());
+            }
         } else {
-            snapshot.setParentOperationId(firstSpan.getOperationId());
+            snapshot.setParentOperationId(parentOperationId);
         }
         return snapshot;
     }
@@ -312,6 +373,11 @@ public class TracingContext implements AbstractTracerContext {
      */
     @Override
     public AbstractSpan createExitSpan(final String operationName, final String remotePeer) {
+        if (isLimitMechanismWorking()) {
+            NoopExitSpan span = new NoopExitSpan(remotePeer);
+            return push(span);
+        }
+
         AbstractSpan exitSpan;
         AbstractSpan parentSpan = peek();
         if (parentSpan != null && parentSpan.isExit()) {
@@ -323,47 +389,13 @@ public class TracingContext implements AbstractTracerContext {
                     new PossibleFound.FoundAndObtain() {
                         @Override
                         public Object doProcess(final int peerId) {
-                            if (isLimitMechanismWorking()) {
-                                return new NoopExitSpan(peerId);
-                            }
-
-                            return DictionaryManager.findEndpointSection()
-                                .findOnly(segment.getServiceId(), operationName)
-                                .doInCondition(
-                                    new PossibleFound.FoundAndObtain() {
-                                        @Override
-                                        public Object doProcess(int operationId) {
-                                            return new ExitSpan(spanIdGenerator++, parentSpanId, operationId, peerId);
-                                        }
-                                    }, new PossibleFound.NotFoundAndObtain() {
-                                        @Override
-                                        public Object doProcess() {
-                                            return new ExitSpan(spanIdGenerator++, parentSpanId, operationName, peerId);
-                                        }
-                                    });
+                            return new ExitSpan(spanIdGenerator++, parentSpanId, operationName, peerId);
                         }
                     },
                     new PossibleFound.NotFoundAndObtain() {
                         @Override
                         public Object doProcess() {
-                            if (isLimitMechanismWorking()) {
-                                return new NoopExitSpan(remotePeer);
-                            }
-
-                            return DictionaryManager.findEndpointSection()
-                                .findOnly(segment.getServiceId(), operationName)
-                                .doInCondition(
-                                    new PossibleFound.FoundAndObtain() {
-                                        @Override
-                                        public Object doProcess(int operationId) {
-                                            return new ExitSpan(spanIdGenerator++, parentSpanId, operationId, remotePeer);
-                                        }
-                                    }, new PossibleFound.NotFoundAndObtain() {
-                                        @Override
-                                        public Object doProcess() {
-                                            return new ExitSpan(spanIdGenerator++, parentSpanId, operationName, remotePeer);
-                                        }
-                                    });
+                            return new ExitSpan(spanIdGenerator++, parentSpanId, operationName, remotePeer);
                         }
                     });
             push(exitSpan);
@@ -406,41 +438,28 @@ public class TracingContext implements AbstractTracerContext {
             throw new IllegalStateException("Stopping the unexpected span = " + span);
         }
 
-        if (checkFinishConditions()) {
-            finish();
-        }
+        finish();
 
         return activeSpanStack.isEmpty();
     }
 
     @Override public AbstractTracerContext awaitFinishAsync() {
-        isRunningInAsyncMode = true;
+        if (!isRunningInAsyncMode) {
+            synchronized (this) {
+                if (!isRunningInAsyncMode) {
+                    asyncFinishLock = new ReentrantLock();
+                    asyncSpanCounter = new AtomicInteger(0);
+                    isRunningInAsyncMode = true;
+                }
+            }
+        }
         asyncSpanCounter.addAndGet(1);
         return this;
     }
 
     @Override public void asyncStop(AsyncSpan span) {
         asyncSpanCounter.addAndGet(-1);
-
-        if (checkFinishConditions()) {
-            finish();
-        }
-    }
-
-    private boolean checkFinishConditions() {
-        if (isRunningInAsyncMode) {
-            asyncFinishLock.lock();
-        }
-        try {
-            if (activeSpanStack.isEmpty() && asyncSpanCounter.get() == 0) {
-                return true;
-            }
-        } finally {
-            if (isRunningInAsyncMode) {
-                asyncFinishLock.unlock();
-            }
-        }
-        return false;
+        finish();
     }
 
     /**
@@ -448,19 +467,42 @@ public class TracingContext implements AbstractTracerContext {
      * TracingContext.ListenerManager}
      */
     private void finish() {
-        TraceSegment finishedSegment = segment.finish(isLimitMechanismWorking());
-        /**
-         * Recheck the segment if the segment contains only one span.
-         * Because in the runtime, can't sure this segment is part of distributed trace.
-         *
-         * @see {@link #createSpan(String, long, boolean)}
-         */
-        if (!segment.hasRef() && segment.isSingleSpanSegment()) {
-            if (!samplingService.trySampling()) {
-                finishedSegment.setIgnore(true);
+        if (isRunningInAsyncMode) {
+            asyncFinishLock.lock();
+        }
+        try {
+            if (activeSpanStack.isEmpty() && running && (!isRunningInAsyncMode || asyncSpanCounter.get() == 0)) {
+                TraceSegment finishedSegment = segment.finish(isLimitMechanismWorking());
+                /*
+                 * Recheck the segment if the segment contains only one span.
+                 * Because in the runtime, can't sure this segment is part of distributed trace.
+                 *
+                 * @see {@link #createSpan(String, long, boolean)}
+                 */
+                if (!segment.hasRef() && segment.isSingleSpanSegment()) {
+                    if (!samplingService.trySampling()) {
+                        finishedSegment.setIgnore(true);
+                    }
+                }
+
+                /*
+                 * Check that the segment is created after the agent (re-)registered to backend,
+                 * otherwise the segment may be created when the agent is still rebooting and should
+                 * be ignored
+                 */
+                if (segment.createTime() < RemoteDownstreamConfig.Agent.INSTANCE_REGISTERED_TIME) {
+                    finishedSegment.setIgnore(true);
+                }
+
+                TracingContext.ListenerManager.notifyFinish(finishedSegment);
+
+                running = false;
+            }
+        } finally {
+            if (isRunningInAsyncMode) {
+                asyncFinishLock.unlock();
             }
         }
-        TracingContext.ListenerManager.notifyFinish(finishedSegment);
     }
 
     /**
